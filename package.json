@@ -1,0 +1,10 @@
+{
+  "scripts": {
+    "start": "node proxy.js"
+  },
+  "dependencies": {
+    "blessed": "^0.1.81",
+    "express": "^5.2.1",
+    "undici": "^7.29.0"
+  }
+}
