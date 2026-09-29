@@ -212,6 +212,41 @@ class ProxyEngine extends EventEmitter {
             return;
         }
 
+        // ===== 1.5 CF 524 規避：等待上游期間主動 keep-alive =====
+        // Cloudflare 在 100s 內沒收到回應就會切線。在等待上游（可能 4 分鐘+）時：
+        //   - stream 請求：先回 200 + SSE headers，每 25s 寫一個 SSE comment
+        //   - 非 stream：退而求其次先送出 headers
+        // 代價：若上游最終失敗，HTTP status 會是已送出的 200（錯誤本體仍照樣轉發）。
+        const wantStream = (() => {
+            try { return JSON.parse((req.body || Buffer.alloc(0)).toString()).stream === true; }
+            catch { return false; }
+        })();
+        let keepAliveInterval = null;
+        const keepAliveTimer = setTimeout(() => {
+            if (session.clientAborted || res.headersSent || res.writableEnded) return;
+            if (wantStream) {
+                res.writeHead(200, {
+                    'content-type': 'text/event-stream; charset=utf-8',
+                    'cache-control': 'no-cache',
+                    'connection': 'keep-alive',
+                });
+                res.write(': keep-alive\n\n');
+                keepAliveInterval = setInterval(() => {
+                    if (!res.writableEnded && !res.destroyed) {
+                        try { res.write(': keep-alive\n\n'); } catch { /* ignore */ }
+                    }
+                }, 25000);
+            } else {
+                res.writeHead(200, { 'content-type': 'application/json' });
+            }
+            this.log(`[Proxy] 🫧 [${session.id}] 上游等待超過 45s，已先送出 headers/keep-alive 以避免 CF 524。`);
+        }, 45000);
+        const stopKeepAlive = () => {
+            clearTimeout(keepAliveTimer);
+            if (keepAliveInterval) clearInterval(keepAliveInterval);
+        };
+        res.on('close', stopKeepAlive);
+
         // ===== 2. 快取 miss → 打 NVIDIA =====
         if (!this.currentKey) await this.fetchKeyFromGAS();
         session.keyTail = this._keyTail(this.currentKey);
@@ -232,8 +267,10 @@ class ProxyEngine extends EventEmitter {
         } catch (error) {
             const detail = error.cause ? (error.cause.code || error.cause.message || error.cause) : '無詳細原因';
             this.error(`[Proxy 本地/網路例外] ❌ [${session.id}] 錯誤: ${error.message} (原因: ${detail})`);
-            if (!res.writableEnded && !res.destroyed) {
+            if (!res.writableEnded && !res.destroyed && !res.headersSent) {
                 res.status(500).json({ error: 'Proxy 內部錯誤', message: error.message });
+            } else if (!res.writableEnded && !res.destroyed) {
+                res.end(JSON.stringify({ error: 'Proxy 內部錯誤', message: error.message }));
             }
             finalize({ status: 500, error: error.message });
         }
@@ -247,7 +284,8 @@ class ProxyEngine extends EventEmitter {
         const deliverAndStore = async (status, pairedHeaders, bodyStream) => {
             const outHeaders = pairedHeaders.filter(([k]) => k.toLowerCase() !== 'content-encoding');
 
-            if (!session.clientAborted) {
+            // keep-alive 可能已搶先送出 headers，此後不可再改 status/headers
+            if (!session.clientAborted && !res.headersSent) {
                 res.status(status);
                 for (const [k, v] of outHeaders) res.setHeader(k, v);
             }
@@ -415,16 +453,23 @@ class ProxyEngine extends EventEmitter {
 
         // 所有退避輪次耗盡
         this.log(`[Proxy] ❌ [${session.id}] 經過所有退避等待輪次，全部 Key 依然無效。`);
-        if (lastFailed && !session.clientAborted) {
+        if (lastFailed && !session.clientAborted && !res.headersSent) {
             res.status(lastFailed.status);
             for (const [k, v] of lastFailed.headers) {
                 if (k.toLowerCase() !== 'content-encoding') res.setHeader(k, v);
             }
             res.end(lastFailed.body);
             finalize({ status: lastFailed.status, error: 'all keys exhausted' });
-        } else if (!lastFailed && !session.clientAborted) {
+        } else if (lastFailed && !session.clientAborted) {
+            // headers 已搶先送出（keep-alive），只能把錯誤本體當成功回應尾巴補上
+            res.end(lastFailed.body);
+            finalize({ status: lastFailed.status, error: 'all keys exhausted (early-headers sent)' });
+        } else if (!lastFailed && !session.clientAborted && !res.headersSent) {
             res.status(429).json({ error: 'All keys exhausted after full backoff cycle.' });
             finalize({ status: 429, error: 'all keys exhausted' });
+        } else if (!lastFailed && !session.clientAborted) {
+            res.end(JSON.stringify({ error: 'All keys exhausted after full backoff cycle.' }));
+            finalize({ status: 429, error: 'all keys exhausted (early-headers sent)' });
         } else {
             finalize({ status: lastFailed?.status ?? 429, error: 'all keys exhausted (client aborted)' });
         }
