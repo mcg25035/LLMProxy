@@ -25,21 +25,7 @@ class HistoryDB {
             );
             CREATE INDEX IF NOT EXISTS idx_requests_started ON requests(started_at);
             CREATE INDEX IF NOT EXISTS idx_requests_status  ON requests(status);
-            CREATE TABLE IF NOT EXISTS cache (
-                hash        TEXT PRIMARY KEY,    -- sha256(method + url + body)
-                method      TEXT,
-                url         TEXT,
-                status      INTEGER,
-                headers     TEXT,                -- JSON
-                body        BLOB,
-                created_at  INTEGER NOT NULL
-            );
-            CREATE INDEX IF NOT EXISTS idx_cache_created ON cache(created_at);
         `);
-        // requests 表補上 cached 欄位（舊 DB 自動升級）
-        try {
-            this.db.exec(`ALTER TABLE requests ADD COLUMN cached INTEGER DEFAULT 0`);
-        } catch (_) { /* 欄位已存在 */ }
         this._insert = this.db.prepare(`
             INSERT INTO requests (session_id, started_at, method, url, key_tail)
             VALUES (?, ?, ?, ?, ?)
@@ -50,33 +36,6 @@ class HistoryDB {
                 key_tail = ?, attempts = ?, backoff_rounds = ?, error = ?, cached = ?
             WHERE id = ?
         `);
-    }
-
-    // ===== 24 小時請求快取 =====
-    getCache(hash, maxAgeMs) {
-        const row = this.db.prepare(
-            `SELECT status, headers, body, created_at FROM cache WHERE hash = ?`
-        ).get(hash);
-        if (!row) return null;
-        if (Date.now() - row.created_at > maxAgeMs) return null; // 過期視為 miss
-        return {
-            status: row.status,
-            headers: JSON.parse(row.headers),
-            body: row.body ? Buffer.from(row.body) : Buffer.alloc(0),
-        };
-    }
-
-    setCache(hash, { method, url, status, headers, body }) {
-        this.db.prepare(`
-            INSERT OR REPLACE INTO cache (hash, method, url, status, headers, body, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-        `).run(hash, method, url, status, JSON.stringify(headers), body, Date.now());
-    }
-
-    purgeExpiredCache(maxAgeMs) {
-        const info = this.db.prepare(`DELETE FROM cache WHERE created_at < ?`)
-            .run(Date.now() - maxAgeMs);
-        return Number(info.changes);
     }
 
     // 請求開始：回傳 row id

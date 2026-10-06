@@ -179,8 +179,6 @@ class TUI {
                 const remaining = Math.max(0, Math.ceil((s.backoffEnd - now) / 1000));
                 return `${this._chip(spinner, C.err)} ${this._chip('backoff 429', C.err)}  ${meta}  retry in ${remaining}s · round ${s.backoffRound}${aborted}`;
             }
-            case 'cached':
-                return `${this._chip('◆', C.violet)} ${this._chip('cache hit', C.violet)}  ${meta}`;
             default:
                 return `${this._chip('•', C.dim)} ${s.state}  ${meta}${aborted}`;
         }

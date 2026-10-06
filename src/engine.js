@@ -2,17 +2,14 @@
 // 職責：
 //   1. 多併發請求處理（每個請求一個獨立 Session）
 //   2. API Key 池管理（GAS 輪換、熱/冷 Key、pacing）
-//   3. 24 小時請求快取：相同 method+url+body 且上次成功(200) → 直接回覆，不打 NVIDIA
-//      客戶端中止也不中斷上游請求，等結果送完再存入快取
-//   4. 歷史紀錄寫入 SQLite
-//   5. 以 EventEmitter 對外發事件，展示層（TUI / 未來 HTTP）訂閱即可
+//   3. 歷史紀錄寫入 SQLite
+//   4. 以 EventEmitter 對外發事件，展示層（TUI / HTTP）訂閱即可
 const { EventEmitter } = require('events');
 const { Readable } = require('stream');
 const crypto = require('crypto');
 const {
     GAS_URL, NVIDIA_BASE_URL,
     PACING_DELAY_SEC, IDLE_SKIP_SEC, BACKOFF_MINUTES,
-    CACHE_TTL_MS,
 } = require('./config');
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -34,13 +31,6 @@ class ProxyEngine extends EventEmitter {
 
         // ---- 活躍 sessions：sessionId -> session ----
         this.sessions = new Map();
-
-        // 定期清理過期快取
-        this._purgeTimer = setInterval(() => {
-            const n = this.db.purgeExpiredCache(CACHE_TTL_MS);
-            if (n > 0) this.log(`[Cache] 🧹 已清理 ${n} 筆過期快取`);
-        }, 10 * 60 * 1000);
-        this._purgeTimer.unref?.();
     }
 
     // ---------- 事件輔助 ----------
@@ -59,18 +49,9 @@ class ProxyEngine extends EventEmitter {
 
     // ---------- 快取 ----------
     // 正規化路徑：客戶端帶不帶 /v1 前綴都支援，內部統一成不帶前綴
-    // 例如 /v1/chat/completions 與 /chat/completions 視為同一支 API（含快取共用）
+    // 例如 /v1/chat/completions 與 /chat/completions 視為同一支 API
     static normalizeUrl(url) {
         return String(url).replace(/^\/v1(?=\/|$)/, '') || '/';
-    }
-
-    static cacheKey(req, url = req.originalUrl) {
-        const body = req.body ? req.body : Buffer.alloc(0);
-        return crypto.createHash('sha256')
-            .update(req.method).update('\0')
-            .update(url).update('\0')
-            .update(body)
-            .digest('hex');
     }
 
     // ---------- Key 管理 ----------
@@ -150,7 +131,6 @@ class ProxyEngine extends EventEmitter {
             firstByteTime: null,
             ttft: 0,
             clientAborted: false,
-            fromCache: false,
         };
         this.sessions.set(session.id, session);
 
@@ -176,12 +156,12 @@ class ProxyEngine extends EventEmitter {
                 attempts: session.attempt,
                 backoffRounds: session.backoffRound,
                 error: result.error ?? null,
-                cached: session.fromCache ? 1 : 0,
+                cached: 0,
             });
             this._removeSession(session);
         };
 
-        // 客戶端中止：記錄下來，但「不」中斷上游請求，繼續跑完以存入快取
+        // 客戶端中止：記錄下來，但「不」中斷上游請求，繼續跑完以留存結果
         res.on('close', () => {
             if (!res.writableEnded && !session.clientAborted) {
                 session.clientAborted = true;
@@ -190,29 +170,7 @@ class ProxyEngine extends EventEmitter {
             }
         });
 
-        // ===== 1. 快取命中：直接回覆，不打 NVIDIA =====
-        const hash = ProxyEngine.cacheKey(req, url);
-        const cached = this.db.getCache(hash, CACHE_TTL_MS);
-        if (cached) {
-            session.fromCache = true;
-            this._updateSession(session, { state: 'cached' });
-            this.log(`[Proxy] 💾 [${session.id}] 快取命中！直接回覆已儲存的成功結果 (${req.method} ${url})`);
-
-            if (!session.clientAborted) {
-                res.status(cached.status);
-                for (const [k, v] of Object.entries(cached.headers)) {
-                    if (k.toLowerCase() !== 'content-encoding' && k.toLowerCase() !== 'content-length') {
-                        res.setHeader(k, v);
-                    }
-                }
-                res.end(cached.body);
-            }
-            session.ttft = (Date.now() - session.startTime) / 1000;
-            finalize({ status: cached.status });
-            return;
-        }
-
-        // ===== 1.5 CF 524 規避：等待上游期間主動 keep-alive =====
+        // ===== 1. CF 524 規避：等待上游期間主動 keep-alive =====
         // Cloudflare 在 100s 內沒收到回應就會切線。在等待上游（可能 4 分鐘+）時：
         //   - stream 請求：先回 200 + SSE headers，每 25s 寫一個 SSE comment
         //   - 非 stream：退而求其次先送出 headers
@@ -263,7 +221,7 @@ class ProxyEngine extends EventEmitter {
         };
 
         try {
-            await this._runWithRetry(req, res, session, hash, finalize, reportDone);
+            await this._runWithRetry(req, res, session, finalize, reportDone);
         } catch (error) {
             const detail = error.cause ? (error.cause.code || error.cause.message || error.cause) : '無詳細原因';
             this.error(`[Proxy 本地/網路例外] ❌ [${session.id}] 錯誤: ${error.message} (原因: ${detail})`);
@@ -276,7 +234,7 @@ class ProxyEngine extends EventEmitter {
         }
     };
 
-    async _runWithRetry(req, res, session, hash, finalize, reportDone) {
+    async _runWithRetry(req, res, session, finalize, reportDone) {
         const roundDelays = [0, ...BACKOFF_MINUTES.map(m => m * 60 * 1000)];
         let lastFailed = null; // { status, headers: [[k,v]...], body: Buffer }
 
@@ -330,20 +288,8 @@ class ProxyEngine extends EventEmitter {
             const body = Buffer.concat(chunks);
             reportDone(status);
 
-            // 🎯 只有成功(200)的結果才寫入 24h 快取
-            if (status === 200) {
-                try {
-                    this.db.setCache(hash, {
-                        method: session.method,
-                        url: session.url,
-                        status,
-                        headers: Object.fromEntries(outHeaders),
-                        body,
-                    });
-                    this.log(`[Cache] 💾 [${session.id}] 成功結果已存入 24 小時快取（${(body.length / 1024).toFixed(1)} KB）`);
-                } catch (e) {
-                    this.error(`[Cache] ❌ 寫入快取失敗: ${e.message}`);
-                }
+            if (status === 200 && body.length === 0) {
+                this.error(`[Proxy] ⚠ [${session.id}] 上游回傳 200 但 body 是空的，視為失敗。`);
             }
             return status;
         };

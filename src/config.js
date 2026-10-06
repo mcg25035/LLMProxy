@@ -33,9 +33,6 @@ module.exports = {
     // 當全部 Key 都 429 時的退避等待時間（分鐘）
     BACKOFF_MINUTES: [1, 2, 3],
 
-    // 成功結果快取保留時間（預設 24 小時）
-    CACHE_TTL_MS: Number(process.env.CACHE_TTL_MS) || 24 * 60 * 60 * 1000,
-
     // SQLite 歷史紀錄資料庫路徑
     DB_PATH: process.env.DB_PATH || path.join(__dirname, '..', 'history.db'),
 };

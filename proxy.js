@@ -62,7 +62,6 @@ app.get('/_api/sessions', (_req, res) => {
         elapsed: (now - s.startTime) / 1000,
         ttft: s.ttft || null,
         clientAborted: s.clientAborted,
-        fromCache: s.fromCache,
     })));
 });
 
