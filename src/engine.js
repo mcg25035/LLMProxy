@@ -276,20 +276,30 @@ class ProxyEngine extends EventEmitter {
                     nodeStream.on('error', reject);
                 });
 
-                // 客戶端還活著才 pipe（中止也繼續把串流讀完）
-                if (!session.clientAborted) nodeStream.pipe(res);
-                else nodeStream.resume();
+                // 客戶端還活著才轉發（中止也繼續把串流讀完）
+                // 手動 write、不自動 end：空回應時保留連線讓上層透明重試
+                if (!session.clientAborted) {
+                    nodeStream.on('data', (chunk) => {
+                        if (!res.writableEnded && !res.destroyed) res.write(chunk);
+                    });
+                } else {
+                    nodeStream.resume();
+                }
 
                 await done;
-            } else if (!session.clientAborted) {
-                res.end();
             }
 
             const body = Buffer.concat(chunks);
+
+            // 上游 200 但 body 空（瞬時過載被斷）：客戶端連線還在 → 回傳 null 讓上層直接重試
+            if (status === 200 && body.length === 0 && !session.clientAborted && !res.writableEnded && !res.destroyed) {
+                return null;
+            }
+
             reportDone(status);
 
-            if (status === 200 && body.length === 0) {
-                this.error(`[Proxy] ⚠ [${session.id}] 上游回傳 200 但 body 是空的，視為失敗。`);
+            if (!session.clientAborted && !res.writableEnded && !res.destroyed) {
+                res.end();
             }
             return status;
         };
@@ -338,62 +348,74 @@ class ProxyEngine extends EventEmitter {
                 if (waitMs > 0) await sleep(waitMs);
 
                 let response;
-                try {
-                    response = await fetch(targetUrl, fetchOptions);
-                } catch (error) {
-                    const detail = error.cause ? (error.cause.code || error.cause.message || error.cause) : '無詳細原因';
-                    throw new Error(`fetch 失敗: ${error.message} (原因: ${detail})`, { cause: error });
-                }
+                let exhaustRound = false;
+                for (;;) {
+                    try {
+                        response = await fetch(targetUrl, fetchOptions);
+                    } catch (error) {
+                        const detail = error.cause ? (error.cause.code || error.cause.message || error.cause) : '無詳細原因';
+                        throw new Error(`fetch 失敗: ${error.message} (原因: ${detail})`, { cause: error });
+                    }
 
-                // 429 / 404 → 換 Key（需收集失敗 body 以便最終轉發）
-                if (response.status === 429 || response.status === 404) {
-                    const st = this._keyState(key);
-                    st.warm = false;
-                    st.lastSuccess = 0;
-                    triedKeys.add(key);
-                    const reqId = response.headers.get('nvcf-reqid') || '無';
-                    this.log(`[Proxy] ⚠ [${session.id}] 遇到 ${response.status} (reqid: ${reqId})。本輪已嘗試: ${triedKeys.size}/${this.totalKeys}`);
+                    // 429 / 404 → 換 Key（需收集失敗 body 以便最終轉發）
+                    if (response.status === 429 || response.status === 404) {
+                        const st = this._keyState(key);
+                        st.warm = false;
+                        st.lastSuccess = 0;
+                        triedKeys.add(key);
+                        const reqId = response.headers.get('nvcf-reqid') || '無';
+                        this.log(`[Proxy] ⚠ [${session.id}] 遇到 ${response.status} (reqid: ${reqId})。本輪已嘗試: ${triedKeys.size}/${this.totalKeys}`);
 
-                    // 收集失敗回應（覆蓋掉上一把 Key 的）
-                    const failBody = Buffer.from(await response.arrayBuffer().catch(() => new ArrayBuffer(0)));
-                    lastFailed = {
-                        status: response.status,
-                        headers: [...response.headers.entries()],
-                        body: failBody,
-                    };
+                        // 收集失敗回應（覆蓋掉上一把 Key 的）
+                        const failBody = Buffer.from(await response.arrayBuffer().catch(() => new ArrayBuffer(0)));
+                        lastFailed = {
+                            status: response.status,
+                            headers: [...response.headers.entries()],
+                            body: failBody,
+                        };
 
-                    if (triedKeys.size < this.totalKeys) {
-                        this.log(`[Proxy] 🔄 [${session.id}] 正在向 GAS 申請換下一把 Key 重試...`);
-                        await this.fetchKeyFromGAS();
+                        if (triedKeys.size < this.totalKeys) {
+                            this.log(`[Proxy] 🔄 [${session.id}] 正在向 GAS 申請換下一把 Key 重試...`);
+                            await this.fetchKeyFromGAS();
+                            break; // 跳出重試迴圈，外層 while 用新 key
+                        }
+                        exhaustRound = true;
+                        break;
+                    }
+
+                    // 其他錯誤狀態
+                    if (response.status !== 200) {
+                        const reqId = response.headers.get('nvcf-reqid') || '無';
+                        const nvStatus = response.headers.get('nvcf-status') || '無';
+                        let errorBodyText = '';
+                        try { errorBodyText = await response.clone().text(); } catch (_) {}
+                        this.error(`\n[NVIDIA 伺服器錯誤] ⚠ [${session.id}] HTTP ${response.status} (${req.method} ${targetUrl})`);
+                        this.error(`  ├─ NVIDIA Request ID: ${reqId}`);
+                        this.error(`  ├─ NVIDIA 狀態: ${nvStatus}`);
+                        this.error(`  └─ NVIDIA 回傳 Body: ${errorBodyText || '(空回應)'}\n`);
+                    }
+
+                    // 200：把這把 Key 標記為熱
+                    if (response.status === 200) {
+                        const st = this._keyState(key);
+                        st.warm = true;
+                        st.lastSuccess = Date.now();
+                    }
+
+                    // 轉發 + 收集；回傳 null = 上游 200 空回應 → 同一把 Key 直接重試（無限次）
+                    const status = await deliverAndStore(
+                        response.status,
+                        [...response.headers.entries()],
+                        response.body,
+                    );
+                    if (status === null) {
+                        this.log(`[Proxy] 🫧 [${session.id}] 上游 200 空回應（瞬時過載），同一把 Key 直接重試。`);
                         continue;
                     }
-                    break;
+                    finalize({ status, error: session.clientAborted ? 'client aborted (result saved)' : null });
+                    return;
                 }
-
-                // 其他錯誤狀態
-                if (response.status !== 200) {
-                    const reqId = response.headers.get('nvcf-reqid') || '無';
-                    const nvStatus = response.headers.get('nvcf-status') || '無';
-                    let errorBodyText = '';
-                    try { errorBodyText = await response.clone().text(); } catch (_) {}
-                    this.error(`\n[NVIDIA 伺服器錯誤] ⚠ [${session.id}] HTTP ${response.status} (${req.method} ${targetUrl})`);
-                    this.error(`  ├─ NVIDIA Request ID: ${reqId}`);
-                    this.error(`  ├─ NVIDIA 狀態: ${nvStatus}`);
-                    this.error(`  └─ NVIDIA 回傳 Body: ${errorBodyText || '(空回應)'}\n`);
-                } else {
-                    const st = this._keyState(key);
-                    st.warm = true;
-                    st.lastSuccess = Date.now();
-                }
-
-                // 轉發 + 收集 + 存快取
-                const status = await deliverAndStore(
-                    response.status,
-                    [...response.headers.entries()],
-                    response.body,
-                );
-                finalize({ status, error: session.clientAborted ? 'client aborted (result cached if 200)' : null });
-                return;
+                if (exhaustRound) break;
             }
         }
 
