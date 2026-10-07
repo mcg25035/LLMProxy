@@ -71,17 +71,32 @@ class ProxyEngine extends EventEmitter {
         this._keyFetching = (async () => {
             try {
                 this.emit('gasState', true);
-                this.log('[Proxy] 正在向 GAS 獲取最久未使用的 Key...');
-                const res = await fetch(GAS_URL);
-                const rawText = await res.text();
-                try {
-                    const data = JSON.parse(rawText);
-                    if (data.error) throw new Error(data.error);
-                    this.currentKey = data.key;
-                    this.totalKeys = data.total || 1;
-                    this.log(`[Proxy] 成功切換 API Key (結尾: ...${this._keyTail(this.currentKey)})`);
-                } catch (parseError) {
-                    throw new Error(`GAS 回傳的不是有效 JSON。回傳內容: ${rawText.substring(0, 100)}\n解析錯誤: ${parseError.message}`);
+                // GAS 有機率故障（回 HTML 錯誤頁等），重試最多 5 次
+                const delays = [0, 2000, 5000, 10000, 15000];
+                let lastErr = null;
+                for (let attempt = 0; attempt < delays.length; attempt++) {
+                    if (delays[attempt] > 0) {
+                        this.log(`[Proxy] 🫧 GAS 抓取失敗，${delays[attempt] / 1000}s 後重試 (第 ${attempt}/${delays.length - 1})...`);
+                        await sleep(delays[attempt]);
+                    }
+                    let rawText = '';
+                    try {
+                        this.log('[Proxy] 正在向 GAS 獲取最久未使用的 Key...');
+                        const res = await fetch(GAS_URL);
+                        rawText = await res.text();
+                        const data = JSON.parse(rawText);
+                        if (data.error) throw new Error(data.error);
+                        this.currentKey = data.key;
+                        this.totalKeys = data.total || 1;
+                        this.log(`[Proxy] 成功切換 API Key (結尾: ...${this._keyTail(this.currentKey)})${attempt > 0 ? `（重試 ${attempt} 次後成功）` : ''}`);
+                        lastErr = null;
+                        break;
+                    } catch (e) {
+                        lastErr = `回傳內容: ${rawText ? rawText.substring(0, 100) : '(無法取得回應)'} | 錯誤: ${e.message}`;
+                    }
+                }
+                if (lastErr) {
+                    this.error(`[Proxy] ❌ 從 GAS 獲取 Key 失敗（已重試 ${delays.length - 1} 次）: ${lastErr}`);
                 }
             } catch (err) {
                 this.error(`[Proxy] ❌ 從 GAS 獲取 Key 失敗: ${err.message}`);
@@ -357,8 +372,8 @@ class ProxyEngine extends EventEmitter {
                         throw new Error(`fetch 失敗: ${error.message} (原因: ${detail})`, { cause: error });
                     }
 
-                    // 429 / 404 → 換 Key（需收集失敗 body 以便最終轉發）
-                    if (response.status === 429 || response.status === 404) {
+                    // 401/429/404 → 換 Key（401 通常是 GAS 故障給了壞 key，或 key 失效）
+                    if (response.status === 401 || response.status === 429 || response.status === 404) {
                         const st = this._keyState(key);
                         st.warm = false;
                         st.lastSuccess = 0;
